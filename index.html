@@ -673,6 +673,16 @@ create table if not exists kanban.notices (
   notice_date text not null, pinned boolean default false,
   created_at timestamptz default now(), updated_at timestamptz default now()
 );
+create table if not exists kanban.task_meta (
+  task_id text primary key, data text not null default '{}',
+  updated_at timestamptz default now()
+);
+create table if not exists kanban.task_files (
+  id text primary key, task_id text not null, phase_id text default '',
+  name text default '', type text default '', size integer default 0,
+  data text default '', created_at timestamptz default now()
+);
+alter table kanban.tasks add column if not exists start_date text default '';
 
 alter table kanban.members    enable row level security;
 alter table kanban.tasks      enable row level security;
@@ -680,6 +690,8 @@ alter table kanban.checklists enable row level security;
 alter table kanban.settings   enable row level security;
 alter table kanban.vacations  enable row level security;
 alter table kanban.notices    enable row level security;
+alter table kanban.task_meta  enable row level security;
+alter table kanban.task_files enable row level security;
 
 drop policy if exists "public_all" on kanban.members;
 drop policy if exists "public_all" on kanban.tasks;
@@ -687,12 +699,16 @@ drop policy if exists "public_all" on kanban.checklists;
 drop policy if exists "public_all" on kanban.settings;
 drop policy if exists "public_all" on kanban.vacations;
 drop policy if exists "public_all" on kanban.notices;
+drop policy if exists "public_all" on kanban.task_meta;
+drop policy if exists "public_all" on kanban.task_files;
 create policy "public_all" on kanban.members    for all using (true) with check (true);
 create policy "public_all" on kanban.tasks      for all using (true) with check (true);
 create policy "public_all" on kanban.checklists for all using (true) with check (true);
 create policy "public_all" on kanban.settings   for all using (true) with check (true);
 create policy "public_all" on kanban.vacations  for all using (true) with check (true);
 create policy "public_all" on kanban.notices    for all using (true) with check (true);
+create policy "public_all" on kanban.task_meta   for all using (true) with check (true);
+create policy "public_all" on kanban.task_files  for all using (true) with check (true);
 
 grant usage on schema kanban to anon, authenticated;
 grant all on all tables in schema kanban to anon, authenticated;
@@ -798,7 +814,7 @@ async function pushTask(t) {
     await sb.schema('kanban').from('tasks').upsert({
       id:td.id,title:td.title,assignee:td.assignee,label:td.label,due:td.due,
       status:td.status,blocker:td.blocker,blocked_at:td.blockedAt,
-      note:td.note,done_date:td.doneDate,updated_at:new Date().toISOString()
+      note:td.note,done_date:td.doneDate,start_date:td.startDate||'',updated_at:new Date().toISOString()
     });
     if(checklist&&checklist.length>0){
       await sb.schema('kanban').from('checklists').upsert(checklist.map((c,i)=>({id:c.id,task_id:t.id,text:c.text,done:c.done,sort_order:i})));
@@ -810,7 +826,11 @@ async function deleteTaskSB(id) {
   saveToLocal();
   if(!sb||sbStatus!=='connected') return;
   syncLock=true;
-  try { await sb.schema('kanban').from('tasks').delete().eq('id',id); }
+  try {
+    await sb.schema('kanban').from('tasks').delete().eq('id',id);
+    try{ await sb.schema('kanban').from('task_meta').delete().eq('task_id',id); }catch(e){}
+    try{ await sb.schema('kanban').from('task_files').delete().eq('task_id',id); }catch(e){}
+  }
   finally { setTimeout(()=>syncLock=false,800); }
 }
 
@@ -830,7 +850,7 @@ async function deleteMemberSB(id) {
   finally { setTimeout(()=>syncLock=false,800); }
 }
 
-async function loadFromSupabase() {
+async function loadFromSupabase(loadFiles) {
   if(!sb) return;
   await _pullSettings();
   const {data:md}=await sb.schema('kanban').from('members').select('*').order('sort_order');
@@ -843,11 +863,38 @@ async function loadFromSupabase() {
   if(nd) notices=nd.map(n=>({id:n.id,title:n.title,content:n.content||'',author:n.author||'',date:n.notice_date,pinned:n.pinned||false}));
   if(td) tasks=td.map(t=>({
     id:t.id,title:t.title,assignee:t.assignee||'',label:t.label||Object.keys(LABELS)[0],due:t.due||'',
+    startDate:t.start_date||'',
     status:t.status||'backlog',blocker:t.blocker||'',blockedAt:t.blocked_at||'',
     note:t.note||'',doneDate:t.done_date||'',
     checklist:(cd||[]).filter(c=>c.task_id===t.id).map(c=>({id:c.id,text:c.text,done:c.done}))
   }));
+  // ── 확장정보(목적/목표/성과/프로세스) + 첨부파일 동기화 ──
+  try{
+    const {data:mt}=await sb.schema('kanban').from('task_meta').select('task_id,data');
+    if(mt) mt.forEach(r=>{ try{ const o=JSON.parse(r.data); if(o&&typeof o==='object') applyMetaRow(r.task_id,o,!loadFiles); }catch(e){} });
+    if(loadFiles){
+      const {data:tf}=await sb.schema('kanban').from('task_files').select('*');
+      if(tf) tf.forEach(f=>{ const m=taskMeta[f.task_id]; if(m&&Array.isArray(m.phases)){ const ph=m.phases.find(p=>p.id===f.phase_id); if(ph){ ph.files=ph.files||[]; ph.files.push({id:f.id,name:f.name,type:f.type,size:f.size,data:f.data}); } } });
+    }
+    saveToLocalMetaSilently();
+  }catch(e){}  // task_meta/task_files 테이블 미생성 시 무시
 }
+// 서버 경량 메타를 로컬 taskMeta에 반영 (keepFiles=true면 기존 첨부 blob 보존)
+function applyMetaRow(taskId, lightObj, keepFiles){
+  if(!Array.isArray(lightObj.phases)) lightObj.phases=[];
+  const existing=taskMeta[taskId];
+  lightObj.phases.forEach(p=>{
+    if(keepFiles && existing && Array.isArray(existing.phases)){
+      const ep=existing.phases.find(x=>x.id===p.id);
+      p.files = (ep&&Array.isArray(ep.files))?ep.files:[];
+    } else { p.files=[]; }
+  });
+  if(typeof lightObj.purpose!=='string')lightObj.purpose='';
+  if(typeof lightObj.goal!=='string')lightObj.goal='';
+  if(typeof lightObj.result!=='string')lightObj.result='';
+  taskMeta[taskId]=lightObj;
+}
+function saveToLocalMetaSilently(){ try{ localStorage.setItem('kb_taskmeta',JSON.stringify(taskMeta)); }catch(e){} }
 
 // ── Push existing tasks to Supabase ──
 async function pushAllToSupabase() {
@@ -857,8 +904,17 @@ async function pushAllToSupabase() {
   try {
     for(const m of MEMBERS) await sb.schema('kanban').from('members').upsert({id:m.id,name:m.name,role:m.role,color:m.color,sort_order:MEMBERS.indexOf(m)});
     for(const t of tasks) {
-      await sb.schema('kanban').from('tasks').upsert({id:t.id,title:t.title,assignee:t.assignee,label:t.label,due:t.due,status:t.status,blocker:t.blocker,blocked_at:t.blockedAt,note:t.note,done_date:t.doneDate});
+      await sb.schema('kanban').from('tasks').upsert({id:t.id,title:t.title,assignee:t.assignee,label:t.label,due:t.due,status:t.status,blocker:t.blocker,blocked_at:t.blockedAt,note:t.note,done_date:t.doneDate,start_date:t.startDate||''});
       if(t.checklist.length>0) await sb.schema('kanban').from('checklists').upsert(t.checklist.map((c,i)=>({id:c.id,task_id:t.id,text:c.text,done:c.done,sort_order:i})));
+    }
+    // 확장정보(목적/목표/성과/프로세스) + 첨부파일
+    for(const id in taskMeta){
+      const m=taskMeta[id]; if(!m) continue;
+      const light={purpose:m.purpose||'',goal:m.goal||'',result:m.result||'',
+        phases:(m.phases||[]).map(p=>({id:p.id,name:p.name,desc:p.desc||'',date:p.date||'',done:!!p.done,files:[]}))};
+      await sb.schema('kanban').from('task_meta').upsert({task_id:id,data:JSON.stringify(light),updated_at:new Date().toISOString()});
+      for(const p of (m.phases||[])) for(const f of (p.files||[]))
+        await sb.schema('kanban').from('task_files').upsert({id:f.id,task_id:id,phase_id:p.id,name:f.name,type:f.type,size:f.size,data:f.data,created_at:new Date().toISOString()});
     }
     for(const v of vacations) await sb.schema('kanban').from('vacations').upsert({id:v.id,member_name:v.name,start_date:v.startDate,end_date:v.endDate,type:v.type,note:v.note});
     for(const n of notices) await sb.schema('kanban').from('notices').upsert({id:n.id,title:n.title,content:n.content,author:n.author,notice_date:n.date,pinned:n.pinned,updated_at:new Date().toISOString()});
@@ -1009,7 +1065,50 @@ let cardEdit=false; // 카드 상세: 내용 보기(false)/수정(true) 모드
 let taskMeta={};
 const DEFAULT_PHASE_NAMES=['사전 준비','행사 당일','사후 관리'];
 function loadTaskMeta(){try{const s=localStorage.getItem('kb_taskmeta');if(s)taskMeta=JSON.parse(s);}catch(e){taskMeta={};}}
-function saveTaskMeta(){try{localStorage.setItem('kb_taskmeta',JSON.stringify(taskMeta));}catch(e){toast('저장 공간이 부족합니다. 첨부파일 용량을 줄여주세요','err');}}
+function saveTaskMeta(tid){
+  try{localStorage.setItem('kb_taskmeta',JSON.stringify(taskMeta));}catch(e){toast('저장 공간이 부족합니다. 첨부파일 용량을 줄여주세요','err');}
+  if(tid) syncMetaToSB(tid);
+}
+// ── 확장정보(목적/목표/성과/프로세스) Supabase 동기화 ──
+const _metaTimers={};
+function syncMetaToSB(id){
+  if(!id||!sb||sbStatus!=='connected') return;
+  clearTimeout(_metaTimers[id]);
+  _metaTimers[id]=setTimeout(()=>_pushMetaNow(id),700);
+}
+async function _pushMetaNow(id){
+  if(!sb||sbStatus!=='connected') return;
+  const m=taskMeta[id]; if(!m) return;
+  const light={purpose:m.purpose||'',goal:m.goal||'',result:m.result||'',
+    phases:(m.phases||[]).map(p=>({id:p.id,name:p.name,desc:p.desc||'',date:p.date||'',done:!!p.done,files:[]}))};
+  syncLock=true;
+  try{
+    await sb.schema('kanban').from('task_meta').upsert({task_id:id,data:JSON.stringify(light),updated_at:new Date().toISOString()});
+    // 텍스트/단계 변경을 다른 기기에 즉시 반영 (task 행을 가볍게 갱신해 실시간 트리거)
+    const t=tasks.find(x=>x.id===id);
+    if(t) await sb.schema('kanban').from('tasks').upsert({id:t.id,title:t.title,assignee:t.assignee,label:t.label,due:t.due,status:t.status,blocker:t.blocker,blocked_at:t.blockedAt,note:t.note,done_date:t.doneDate,start_date:t.startDate||'',updated_at:new Date().toISOString()});
+  }catch(e){}
+  finally{ setTimeout(()=>syncLock=false,800); }
+}
+async function _pushFileSB(taskId,phaseId,f){
+  if(!sb||sbStatus!=='connected') return;
+  syncLock=true;
+  try{ await sb.schema('kanban').from('task_files').upsert({id:f.id,task_id:taskId,phase_id:phaseId,name:f.name,type:f.type,size:f.size,data:f.data,created_at:new Date().toISOString()}); }
+  catch(e){ toast('첨부 동기화 실패(용량 초과 가능)','warn'); }
+  finally{ setTimeout(()=>syncLock=false,800); }
+}
+async function _deleteFileSB(fid){
+  if(!sb||sbStatus!=='connected') return;
+  syncLock=true;
+  try{ await sb.schema('kanban').from('task_files').delete().eq('id',fid); }catch(e){}
+  finally{ setTimeout(()=>syncLock=false,800); }
+}
+async function _deletePhaseFilesSB(pid){
+  if(!sb||sbStatus!=='connected') return;
+  syncLock=true;
+  try{ await sb.schema('kanban').from('task_files').delete().eq('phase_id',pid); }catch(e){}
+  finally{ setTimeout(()=>syncLock=false,800); }
+}
 function getMeta(id){
   let m=taskMeta[id];
   if(!m){m=taskMeta[id]={purpose:'',goal:'',result:'',phases:DEFAULT_PHASE_NAMES.map(nm=>({id:uuid(),name:nm,desc:'',date:'',done:false,files:[]}))};}
@@ -1771,7 +1870,7 @@ function renderPhases(t){
 }
 
 function _refreshPhases(tid){const t=tasks.find(x=>x.id===tid);const c=$(`card-phases-${tid}`);if(c&&t)c.innerHTML=renderPhases(t);}
-function savePG(tid){const m=getMeta(tid);const pu=$(`cd-purpose-${tid}`),go=$(`cd-goal-${tid}`),re=$(`cd-result-${tid}`);if(pu)m.purpose=pu.value;if(go)m.goal=go.value;if(re)m.result=re.value;saveTaskMeta();}
+function savePG(tid){const m=getMeta(tid);const pu=$(`cd-purpose-${tid}`),go=$(`cd-goal-${tid}`),re=$(`cd-result-${tid}`);if(pu)m.purpose=pu.value;if(go)m.goal=go.value;if(re)m.result=re.value;saveTaskMeta(tid);}
 
 // 카드 상세 화면의 모든 입력(목적·목표·단계 세부내용·완료일·팀장 멘트사항 등)을 한 번에 저장
 function saveCardDetail(tid){
@@ -1792,31 +1891,31 @@ function saveCardDetail(tid){
   }
   const note=$('modal-note');if(note)t.note=note.value;
   const bl=$('modal-blocker');if(bl)t.blocker=bl.value;
-  saveTaskMeta();
+  saveTaskMeta(tid);
   pushTask(t);
   renderBoard();
   toast('💾 프로젝트 내용이 저장되었습니다');
   cardEdit=false;
   openCard(tid);
 }
-function addPhase(tid){const m=getMeta(tid);m.phases.push({id:uuid(),name:'새 단계',desc:'',date:'',done:false,files:[]});saveTaskMeta();_refreshPhases(tid);}
-function deletePhase(tid,pid){const m=getMeta(tid);if(m.phases.length<=1){toast('단계는 최소 1개 필요합니다','warn');return;}if(!confirm('이 단계를 삭제할까요?\n첨부파일도 함께 삭제됩니다.'))return;m.phases=m.phases.filter(p=>p.id!==pid);saveTaskMeta();_refreshPhases(tid);renderBoard();}
-function movePhase(tid,pid,dir){const m=getMeta(tid);const i=m.phases.findIndex(p=>p.id===pid);const j=i+dir;if(j<0||j>=m.phases.length)return;[m.phases[i],m.phases[j]]=[m.phases[j],m.phases[i]];saveTaskMeta();_refreshPhases(tid);}
-function renamePhase(tid,pid,val){const m=getMeta(tid);const p=m.phases.find(x=>x.id===pid);if(p){p.name=(val||'').trim()||p.name;saveTaskMeta();}}
-function setPhaseDate(tid,pid,val){const m=getMeta(tid);const p=m.phases.find(x=>x.id===pid);if(p){p.date=val||'';saveTaskMeta();}}
-function setPhaseDesc(tid,pid,val){const m=getMeta(tid);const p=m.phases.find(x=>x.id===pid);if(p){p.desc=val||'';saveTaskMeta();}}
-function togglePhaseDone(tid,pid){const m=getMeta(tid);const p=m.phases.find(x=>x.id===pid);if(p){p.done=!p.done;saveTaskMeta();_refreshPhases(tid);renderBoard();}}
-function delFile(tid,pid,fid){const m=getMeta(tid);const p=m.phases.find(x=>x.id===pid);if(p){p.files=(p.files||[]).filter(f=>f.id!==fid);saveTaskMeta();_refreshPhases(tid);toast('첨부 삭제됨');}}
+function addPhase(tid){const m=getMeta(tid);m.phases.push({id:uuid(),name:'새 단계',desc:'',date:'',done:false,files:[]});saveTaskMeta(tid);_refreshPhases(tid);}
+function deletePhase(tid,pid){const m=getMeta(tid);if(m.phases.length<=1){toast('단계는 최소 1개 필요합니다','warn');return;}if(!confirm('이 단계를 삭제할까요?\n첨부파일도 함께 삭제됩니다.'))return;m.phases=m.phases.filter(p=>p.id!==pid);saveTaskMeta(tid);_deletePhaseFilesSB(pid);_refreshPhases(tid);renderBoard();}
+function movePhase(tid,pid,dir){const m=getMeta(tid);const i=m.phases.findIndex(p=>p.id===pid);const j=i+dir;if(j<0||j>=m.phases.length)return;[m.phases[i],m.phases[j]]=[m.phases[j],m.phases[i]];saveTaskMeta(tid);_refreshPhases(tid);}
+function renamePhase(tid,pid,val){const m=getMeta(tid);const p=m.phases.find(x=>x.id===pid);if(p){p.name=(val||'').trim()||p.name;saveTaskMeta(tid);}}
+function setPhaseDate(tid,pid,val){const m=getMeta(tid);const p=m.phases.find(x=>x.id===pid);if(p){p.date=val||'';saveTaskMeta(tid);}}
+function setPhaseDesc(tid,pid,val){const m=getMeta(tid);const p=m.phases.find(x=>x.id===pid);if(p){p.desc=val||'';saveTaskMeta(tid);}}
+function togglePhaseDone(tid,pid){const m=getMeta(tid);const p=m.phases.find(x=>x.id===pid);if(p){p.done=!p.done;saveTaskMeta(tid);_refreshPhases(tid);renderBoard();}}
+function delFile(tid,pid,fid){const m=getMeta(tid);const p=m.phases.find(x=>x.id===pid);if(p){p.files=(p.files||[]).filter(f=>f.id!==fid);saveTaskMeta(tid);_deleteFileSB(fid);_refreshPhases(tid);toast('첨부 삭제됨');}}
 function attachFile(tid,pid){
   const inp=document.createElement('input');inp.type='file';inp.multiple=true;
   inp.onchange=()=>{
     const files=[...inp.files];if(files.length===0)return;
     let pending=files.length;
-    const finish=()=>{if(--pending<=0){saveTaskMeta();_refreshPhases(tid);}};
+    const finish=()=>{if(--pending<=0){saveTaskMeta(tid);_refreshPhases(tid);}};
     files.forEach(f=>{
       if(f.size>3*1024*1024){toast(`${f.name}: 3MB 초과로 첨부 불가`,'warn');finish();return;}
       const r=new FileReader();
-      r.onload=()=>{const m=getMeta(tid);const p=m.phases.find(x=>x.id===pid);if(p){p.files=p.files||[];p.files.push({id:uuid(),name:f.name,type:f.type,size:f.size,data:r.result});}finish();};
+      r.onload=()=>{const m=getMeta(tid);const p=m.phases.find(x=>x.id===pid);if(p){p.files=p.files||[];const fo={id:uuid(),name:f.name,type:f.type,size:f.size,data:r.result};p.files.push(fo);_pushFileSB(tid,pid,fo);}finish();};
       r.onerror=()=>{toast(`${f.name} 읽기 실패`,'err');finish();};
       r.readAsDataURL(f);
     });
@@ -2398,7 +2497,7 @@ async function saveSupabaseConfig(){
   closeModal();
   toast('연결 중...');
   const ok=await initSupabase();
-  if(ok){await loadFromSupabase();renderAll();toast('✅ Supabase 연결 완료! 📥 설정 포함 파일을 다운로드해 GitHub에 올리세요');}
+  if(ok){await loadFromSupabase(true);renderAll();toast('✅ Supabase 연결 완료! 📥 설정 포함 파일을 다운로드해 GitHub에 올리세요');}
 }
 
 function downloadConfiguredHTML(){
@@ -2801,7 +2900,7 @@ async function init(){
   renderAll();
   const ok=await initSupabase();
   if(ok){
-    await loadFromSupabase();
+    await loadFromSupabase(true);
     if(tasks.length===0){tasks=DEFAULT_TASKS();await pushAllToSupabase();}
     renderAll();
   }
