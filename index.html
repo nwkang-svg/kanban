@@ -2560,7 +2560,7 @@ function showModal(title, body, foot, cls){
   $('overlay').classList.add('show');
 }
 function closeModal(){$('overlay').classList.remove('show');editingMemberId=null;}
-$('overlay').addEventListener('click',e=>{if(e.target===$('overlay'))closeModal();});
+// 바깥(어두운 영역) 클릭으로는 닫히지 않음 — 우측 하단 '닫기' 또는 상단 ✕ 버튼으로만 닫힘
 
 
 // ══════════════════════════════════════════════
